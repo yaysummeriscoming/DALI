@@ -78,7 +78,7 @@ parser.add_argument("--local_rank", default=0, type=int)
 cudnn.benchmark = True
 
 class HybridTrainPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, dali_cpu=False):
+    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, dali_cpu=False, fp16=False):
         super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
         #let user decide which pipeline works him bets for RN version he runs
@@ -92,8 +92,13 @@ class HybridTrainPipe(Pipeline):
             self.decode = ops.nvJPEGDecoder(device="mixed", output_type=types.RGB, device_memory_padding=211025920, host_memory_padding=140544512)
 
         self.rrc = ops.RandomResizedCrop(device=dali_device, size =(crop, crop))
-        self.cmnp = ops.CropMirrorNormalize(device="gpu",
-                                            output_dtype=types.FLOAT,
+
+        output_dtype = types.FLOAT
+        if fp16:
+            output_dtype = types.FLOAT16
+
+        self.cmnp = ops.CropMirrorNormalize(device=dali_device,  # 1: changed from "cpu" to dali_device
+                                            output_dtype=output_dtype,  # 2: output to fp16 when fp16 training
                                             output_layout=types.NCHW,
                                             crop=(crop, crop),
                                             image_type=types.RGB,
@@ -107,8 +112,9 @@ class HybridTrainPipe(Pipeline):
         self.jpegs, self.labels = self.input(name="Reader")
         images = self.decode(self.jpegs)
         images = self.rrc(images)
-        output = self.cmnp(images.gpu(), mirror=rng)
-        return [output, self.labels]
+        output = self.cmnp(images, mirror=rng)  # 3: removed gpu transfer
+        return [output.gpu(), self.labels]  # 4: added gpu transfer
+
 
 class HybridValPipe(Pipeline):
     def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size):
@@ -244,7 +250,7 @@ def main():
         crop_size = 224
         val_size = 256
 
-    pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu)
+    pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu, fp16=args.fp16)
     pipe.build()
     train_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader") / args.world_size))
 
